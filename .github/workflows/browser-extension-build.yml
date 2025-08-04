@@ -1,0 +1,139 @@
+name: "Build Browser Extensions"  # If you change this name, you'll also need to update the release.yaml job
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - browser-extension/**
+      - .github/workflows/**
+  push:
+    paths:
+      - browser-extension/**
+      - .github/workflows/**
+    branches:
+      - '**'
+    tags:
+      # Only run on release tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  build-extensions:
+    name: Build and bundle the browser extensions
+    # Since we run on both branch pushes and PRs, don't do a duplicated run if the PR is for a branch in the local repo:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: browser-extension
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history to pull git tags
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Get version from git tag
+        id: get-version
+        run: |
+          VERSION=$(npm run --silent get-version)
+          if [[ -z "$VERSION" ]]; then
+            echo "❌ Version extraction failed"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION"
+
+      - name: Build our browser extensions
+        run: |
+          npm run build
+
+      - name: Run Firefox linting
+        run: |
+          npm run lint-firefox
+
+      - name: Package Chrome extension
+        # Note that the CI artifact will be double-zipped because actions/upload-artifact zips it again.
+        # But this is necessary because actions/download-artifact will always attempt to unzip.
+        run: |
+          npm run package-chrome
+
+      - name: Package Firefox extension (unsigned)
+        run: |
+          npm run package-firefox
+
+      - name: Package Firefox extension (signed for release)
+        id: sign-firefox-extension
+        # Only sign versions that we actually intend to release. Mozilla does not allow the same version
+        # number to be signed multiple times, so duplicated build attempts will fail.
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.FIREFOX_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.FIREFOX_JWT_SECRET }}
+        run: |
+          npm run sign-firefox
+
+      - name: Validate manifest files
+        run: |
+          if [[ ! -f "build/chrome/manifest.json" ]] || [[ ! -f "build/firefox/manifest.json" ]]; then
+            echo "❌ Manifest files not found"
+            exit 1
+          fi
+
+          # Check that version was injected correctly
+          CHROME_VERSION=$(jq .version build/chrome/manifest.json)
+          FIREFOX_VERSION=$(jq .version build/firefox/manifest.json)
+
+          if [[ -z "$CHROME_VERSION" ]] || [[ "null" == "$CHROME_VERSION" ]]; then
+            echo "❌ Manifest missing version number"
+            exit 1
+          fi
+
+          if [[ "$CHROME_VERSION" != "$FIREFOX_VERSION" ]]; then
+            echo "❌ Version mismatch between Chrome ($CHROME_VERSION) and Firefox ($FIREFOX_VERSION)"
+            exit 1
+          fi
+
+          echo "✅ Manifest validation passed - Version: $CHROME_VERSION"
+
+      - name: Rename Chrome extension
+        run: |
+          mv ./build/chrome-extension.zip ./build/chrome-extension-v${{ steps.get-version.outputs.version }}.zip
+
+      - name: Rename Firefox extension (unsigned)
+        run: |
+          mv ./build/firefox-extension.zip ./build/firefox-extension-unsigned-v${{ steps.get-version.outputs.version }}.zip
+
+      - name: Rename Firefox extension (signed)
+        if: ${{ steps.sign-firefox-extension.outcome != 'skipped' }}
+        run: |
+          mv ./build/streamdeck_googlemeet-${{ steps.get-version.outputs.version }}.xpi ./build/firefox-extension-v${{ steps.get-version.outputs.version }}.xpi
+
+      - name: Upload Chrome extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # If you change this artifact name or filename, you must also update the release job's download-artifact steps.
+          name: chrome-extension
+          path: browser-extension/build/chrome-extension-v${{ steps.get-version.outputs.version }}.zip
+
+      - name: Upload Firefox extension artifact (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          # If you change this artifact name or filename, you must also update the release job's download-artifact steps.
+          name: firefox-extension-unsigned
+          path: browser-extension/build/firefox-extension-unsigned-v${{ steps.get-version.outputs.version }}.zip
+
+      - name: Upload Firefox extension artifact (signed)
+        if: ${{ steps.sign-firefox-extension.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          # If you change this artifact name or filename, you must also update the release job's download-artifact steps.
+          name: firefox-extension-signed
+          path: browser-extension/build/firefox-extension-v${{ steps.get-version.outputs.version }}.xpi
